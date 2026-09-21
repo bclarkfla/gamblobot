@@ -65,14 +65,36 @@ Same image for `app` and `scheduler`, different entrypoints.
 7. **Settle and evaluate** — §9.
 ## 5. Kalshi integration notes
  
-Verify all of this against the official docs before coding — these are from secondary
-sources and Kalshi has been changing things.
+Verified against the live docs at docs.kalshi.com as of 2026-09-20 (see below for what
+changed from the original secondary-sourced draft). Re-verify before coding against
+anything not covered here — Kalshi has been changing things.
  
-- Production base URL: `https://api.elections.kalshi.com/trade-api/v2`
-- Demo base URL: `https://external-api.demo.kalshi.co/trade-api/v2`
-- Auth: RSA-PSS request signing. Headers `KALSHI-ACCESS-KEY` (key id),
-  `KALSHI-ACCESS-SIGNATURE`, `KALSHI-ACCESS-TIMESTAMP` (ms). Signature covers
-  `timestamp + METHOD + path`.
+- **Production base URL:** `https://external-api.kalshi.com/trade-api/v2` (the earlier
+  `api.elections.kalshi.com` URL in this doc was stale/wrong).
+- **Demo base URL:** `https://external-api.demo.kalshi.co/trade-api/v2`.
+- **Auth:** RSA-PSS (MGF1-SHA256, salt length = digest length) request signing. Headers
+  `KALSHI-ACCESS-KEY` (key id), `KALSHI-ACCESS-SIGNATURE`, `KALSHI-ACCESS-TIMESTAMP` (ms).
+  Signature covers `timestamp + METHOD + path`, path only (no query string).
+- **Public market data needs no auth at all.** `GET /markets`, `/series/{ticker}`,
+  `/series` (list), `/events/{ticker}` are unauthenticated. RSA-PSS signing is only needed
+  for private endpoints (portfolio, orders) — still worth building and smoke-testing against
+  something like `/portfolio/balance` even though `sync_markets`/`snapshot_prices` won't
+  need it.
+- **Category lives on the series, not the market.** `GET /markets` returns `event_ticker` /
+  `series_ticker` but no category field. Category (`category` primary + `categories[]`
+  discovery list) lives on `GET /series/{ticker}` and `GET /series` (filterable by
+  `category=`, matches against the `categories` list). To build the category allowlist:
+  resolve category via series and join down to markets by `series_ticker`. **The valid
+  category strings are not enumerated in the docs** — call `GET /series` live and inspect
+  real values before hardcoding the allowlist; don't guess strings for a legal-compliance
+  filter.
+- **Market status is a richer enum than open/closed/settled:** `initialized, inactive,
+  active, closed, determined, disputed, amended, finalized`. Needs an explicit mapping to
+  whatever simplified status model the jobs use.
+- **Pricing is sub-penny, not whole-cent.** Market fields are fixed-point dollar *strings*
+  with up to 6 decimal places (e.g. `yes_bid_dollars: "0.5600"`), and contract counts are
+  fractional with 0.01 minimum granularity (`volume_fp`, etc.) — there is no legacy
+  integer-cents field. See §8: stored as scaled integers, not floats.
 - Python SDK: `kalshi_python_sync` (async variant `kalshi_python_async`). The older
   `kalshi-python` is deprecated. Writing the ~30 lines of signing by hand is also a
   reasonable learning exercise and removes a dependency.
@@ -109,6 +131,13 @@ Kalshi quotes in cents = implied probability, which makes this pleasantly simple
   scheduler skips the decide job and writes a `halted` row.
 ## 8. Schema
  
+Money and contract-count columns are scaled integers, not floats or whole-cent ints —
+Kalshi's live API returns sub-penny prices and fractional contract counts (see §5).
+Prices are millionths of a dollar (`*_micros`); contract/volume counts are hundredths of a
+contract (`*_hundredths`). Applied as migrations `0001_initial_schema.sql` (this block, in
+its original whole-cent form) and `0002_scaled_int_pricing.sql` (the rename to scaled
+integers below) — the SQL here reflects current state, not the literal migration history.
+ 
 ```sql
 create table markets (
   ticker            text primary key,
@@ -124,11 +153,11 @@ create table markets (
 );
  
 create table price_snapshots (
-  id            bigserial primary key,
-  ticker        text not null references markets(ticker),
-  observed_at   timestamptz not null,
-  yes_bid       int, yes_ask int, last_price int,   -- cents
-  volume        bigint, open_interest bigint
+  id                        bigserial primary key,
+  ticker                    text not null references markets(ticker),
+  observed_at               timestamptz not null,
+  yes_bid_micros            int, yes_ask_micros int, last_price_micros int,  -- millionths of a dollar
+  volume_hundredths         bigint, open_interest_hundredths bigint         -- hundredths of a contract
 );
 create index on price_snapshots (ticker, observed_at desc);
  
@@ -152,29 +181,29 @@ create table decisions (
 );
  
 create table positions (
-  id               uuid primary key,
-  decision_id      uuid not null references decisions(id),
-  ticker           text not null references markets(ticker),
-  side             text not null,
-  contracts        int not null,
-  entry_price      int not null,             -- cents, the simulated fill
-  entry_quote      jsonb not null,           -- full top-of-book at decision time
-  fees_paid_cents  int not null,
-  opened_at        timestamptz not null,
-  status           text not null,            -- open | settled | closed_early
-  exit_price       int,
-  closed_at        timestamptz,
-  pnl_cents        int
+  id                     uuid primary key,
+  decision_id            uuid not null references decisions(id),
+  ticker                 text not null references markets(ticker),
+  side                   text not null,
+  contracts_hundredths   int not null,             -- hundredths of a contract
+  entry_price_micros     int not null,             -- millionths of a dollar, the simulated fill
+  entry_quote            jsonb not null,           -- full top-of-book at decision time
+  fees_paid_micros       int not null,
+  opened_at              timestamptz not null,
+  status                 text not null,            -- open | settled | closed_early
+  exit_price_micros      int,
+  closed_at              timestamptz,
+  pnl_micros             int
 );
  
 create table evaluations (
-  id                uuid primary key,
-  position_id       uuid not null references positions(id),
-  computed_at       timestamptz not null default now(),
-  closing_price     int,                     -- last price before close_time
-  clv_cents         double precision,        -- signed, in our favor is positive
-  brier             double precision,
-  won               boolean
+  id                    uuid primary key,
+  position_id           uuid not null references positions(id),
+  computed_at           timestamptz not null default now(),
+  closing_price_micros  int,                     -- millionths of a dollar, last price before close_time
+  clv_cents             double precision,        -- signed, in our favor is positive (not yet moved to micros — flagged open question, see §13)
+  brier                 double precision,
+  won                   boolean
 );
  
 create table runs (
@@ -260,3 +289,11 @@ the loop.
 - Do you want the daily run to notify you — email, or just the web page?
 - Phase 2 (real money, small) is out of scope here, but the fill interface should be
   written as though it's coming.
+- `decisions.edge_cents` and `evaluations.clv_cents` are still `double precision`, same as
+  the original draft — not moved to scaled integers like the rest of §8 was. Worth deciding
+  before M2/M4 whether these should also become `*_micros` ints for consistency with the
+  no-floats-for-money rule, given they're derived directly from prices that are now scaled
+  ints.
+- Kalshi's valid series `category` values aren't enumerated in the docs (see §5) — need to
+  hit `GET /series` live during M1 and confirm the exact strings before hardcoding the
+  economics/climate/financial-indicators allowlist.
